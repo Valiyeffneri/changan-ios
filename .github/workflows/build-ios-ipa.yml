@@ -1,0 +1,58 @@
+name: Build Unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project and build unsigned Release .app
+        working-directory: ios-app
+        run: |
+          xcodegen generate
+          xcodebuild \
+            -project ChanganRemote.xcodeproj \
+            -scheme ChanganRemote \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ONLY_ACTIVE_ARCH=NO \
+            clean build
+
+      - name: Package ChanganRemote-unsigned.ipa
+        working-directory: ios-app
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/ChanganRemote.app"
+          test -d "$APP_PATH"
+          rm -rf ipa ChanganRemote-unsigned.ipa
+          mkdir -p ipa/Payload
+          cp -R "$APP_PATH" ipa/Payload/
+          cd ipa
+          zip -qry ../ChanganRemote-unsigned.ipa Payload
+          ls -lh ../ChanganRemote-unsigned.ipa
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChanganRemote-unsigned-ipa
+          path: ios-app/ChanganRemote-unsigned.ipa
+          if-no-files-found: error
