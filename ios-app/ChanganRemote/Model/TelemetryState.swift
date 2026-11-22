@@ -48,10 +48,12 @@ enum LinkHealthState: String {
 
 struct ConnectionUiState: Equatable {
     var cloudState: LinkHealthState = .disconnected
+    var btState: LinkHealthState = .disconnected
     var agentPresenceOnline: Bool = false
     var isReconnectingInGrace: Bool = false
     var isOnline: Bool = false
     var cloudLatencyMs: Int64? = nil
+    var btLatencyMs: Int64? = nil
 }
 
 struct TelemetryState: Equatable {
@@ -66,10 +68,12 @@ struct TelemetryState: Equatable {
     var isLiveCloudSample: Bool = false
     var isPresenceOnline: Bool = false
     var isReconnectingGrace: Bool = false
+    var isBluetoothConnected: Bool = false
     var isConnected: Bool = false
 
     var lastUpdateEpoch: Int64 = 0
     var lastCloudUpdateEpoch: Int64 = 0
+    var lastBluetoothUpdateEpoch: Int64 = 0
 
     var ignitionState: Int = -1
     var ignitionDescription: String = "Məlumat yoxdur"
@@ -293,6 +297,17 @@ struct TelemetryState: Equatable {
         if isPresenceOnline { return true }
         let delta = nowSeconds - lastCloudUpdateEpoch
         return isBrokerConnected && lastCloudUpdateEpoch > 0 && delta >= -30 && delta <= CommandProtocol.telemetryOnlineStaleSeconds
+    }
+
+    func isBluetoothLive(nowSeconds: Int64 = Int64(Date().timeIntervalSince1970)) -> Bool {
+        guard isBluetoothConnected else { return false }
+        if lastBluetoothUpdateEpoch == 0 { return true }
+        let delta = nowSeconds - lastBluetoothUpdateEpoch
+        return delta >= -30 && delta <= CommandProtocol.telemetryOnlineStaleSeconds
+    }
+
+    func isTrulyOnline(nowSeconds: Int64 = Int64(Date().timeIntervalSince1970)) -> Bool {
+        isBluetoothLive(nowSeconds: nowSeconds) || isCloudLive(nowSeconds: nowSeconds)
     }
 
     func lastSeenDescription() -> String {

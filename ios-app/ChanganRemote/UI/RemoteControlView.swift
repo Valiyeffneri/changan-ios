@@ -73,6 +73,23 @@ struct RemoteControlView: View {
 
                             Spacer()
 
+                            // Bluetooth (BLE) Status Badge
+                            Button {
+                                viewModel.toggleBluetoothConnection()
+                            } label: {
+                                let isBt = viewModel.btState == .connected
+                                let isBtConn = viewModel.btState == .connecting
+                                Label(
+                                    isBt ? "BT aktiv" : (isBtConn ? "BT..." : "BT"),
+                                    systemImage: isBt ? "dot.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash"
+                                )
+                                .font(.caption.weight(.bold))
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background((isBt ? Color.accentColor : Color.secondary).opacity(0.16), in: RoundedRectangle(cornerRadius: 10))
+                                .foregroundStyle(isBt ? Color.accentColor : .secondary)
+                            }
+
                             // Cloud Status Badge
                             Button {
                                 if viewModel.connectionUiState.cloudState == .connected {
@@ -87,7 +104,7 @@ struct RemoteControlView: View {
                                     systemImage: cloudOnline ? "icloud.fill" : "icloud.slash"
                                 )
                                 .font(.caption.weight(.bold))
-                                .padding(.horizontal, 10)
+                                .padding(.horizontal, 9)
                                 .padding(.vertical, 5)
                                 .background((cloudOnline ? Color.green : Color.secondary).opacity(0.16), in: RoundedRectangle(cornerRadius: 10))
                                 .foregroundStyle(cloudOnline ? .green : .secondary)

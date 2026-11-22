@@ -34,6 +34,7 @@ targets:
         NSCameraUsageDescription: "Avtomobilin QR kodunu skan etmək üçün kamera icazəsi lazımdır."
         NSMicrophoneUsageDescription: "Xarici meqafon funksiyası üçün mikrofon icazəsi lazımdır."
         NSPhotoLibraryAddUsageDescription: "Avtomobil kamerasından çəkilmiş şəkilləri Qalereyaya saxlamaq üçün icazə lazımdır."
+        NSBluetoothAlwaysUsageDescription: "Avtomobilə yaxın məsafədən birbaşa Bluetooth (BLE) ilə qoşulmaq üçün icazə tələb olunur."
         NSLocalNetworkUsageDescription: "Avtomobilin agentinə qoşulmaq üçün şəbəkə icazəsi tələb olunur."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

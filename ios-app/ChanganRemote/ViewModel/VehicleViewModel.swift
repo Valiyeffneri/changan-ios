@@ -48,6 +48,7 @@ final class VehicleViewModel: ObservableObject {
     @Published var isTalking: Bool = false
     @Published var avasVolumeTier: String
     @Published var avasVolume: Float
+    @Published var btState: BtConnectionState = .disconnected
 
     // MARK: - Confirmation Dialog State
     struct ControlConfirmation: Identifiable {
@@ -65,13 +66,16 @@ final class VehicleViewModel: ObservableObject {
 
     private let defaults = UserDefaults.standard
     private var mqttClient: MqttClient!
+    private var bleManager: BleVehicleManager!
     private let optimisticRegistry = OptimisticStateRegistry(defaultHoldSeconds: 5.0)
     private var lastConfirmedTelemetry: TelemetryState
 
     private var cloudConnected = false
+    private var bluetoothWanted = true
     private var agentPresenceOnline = false
     private var lastOnlineAt: Date?
     private var cloudLatencyMs: Int64?
+    private var btLatencyMs: Int64?
     private var manualCloudDisabled = false
     private var lastTrulyOnline = false
     private var syncTemperatures = true
@@ -82,6 +86,7 @@ final class VehicleViewModel: ObservableObject {
         let action: String
         let timeoutTask: Task<Void, Never>
         let silent: Bool
+        let channelUsed: String
         let sentAt: Date
         let optimisticKeys: Set<String>
     }
@@ -100,8 +105,10 @@ final class VehicleViewModel: ObservableObject {
     private var cabinListenKeepaliveTask: Task<Void, Never>?
 
     private var activeVideoId: String?
+    private var activeVideoTransport: String = "MQTT"
     private var lastVideoSequence = 0
     private var activeCabinAudioId: String?
+    private var activeCabinTransport: String = "MQTT"
     private var lastAudioSequence = 0
     private var talkStartId: String?
     private var talkReadyWaiter: CheckedContinuation<(Bool, String), Never>?
@@ -165,6 +172,7 @@ final class VehicleViewModel: ObservableObject {
 
         self.mqttClient = MqttClient(brokerUrl: initialBroker, vin: cleanVin, secretKey: initialSecret)
         self.mqttClient.allowInsecureCustomTls = self.allowInsecureCustomTls
+        self.bleManager = BleVehicleManager(expectedVin: cleanVin, secretKey: initialSecret)
 
         self.mqttClient.onStateChanged = { [weak self] newState in
             Task { @MainActor [weak self] in
@@ -175,7 +183,7 @@ final class VehicleViewModel: ObservableObject {
         }
         self.mqttClient.onTelemetryReceived = { [weak self] state in
             Task { @MainActor [weak self] in
-                self?.receiveTelemetry(state)
+                self?.receiveTelemetry(state, bluetooth: false)
             }
         }
         self.mqttClient.onPresenceChanged = { [weak self] online, ts in
@@ -195,9 +203,51 @@ final class VehicleViewModel: ObservableObject {
         }
         self.mqttClient.onTransportStatus = { [weak self] id, status, _ in
             Task { @MainActor [weak self] in
-                guard let self, self.pending[id] != nil else { return }
+                guard let self, let item = self.pending[id], item.channelUsed != "Blutuz" else { return }
                 if status == "EXPIRED" || status == "CANCELLED" || status == "FAILED" {
                     self.finishCommand(id, text: "Avtomobillə əlaqə yoxdur", isError: true)
+                }
+            }
+        }
+
+        self.bleManager.onStateChanged = { [weak self] newBtState in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.btState = newBtState
+                self.updateConnectivity()
+            }
+        }
+        self.bleManager.onTelemetryReceived = { [weak self] state in
+            Task { @MainActor [weak self] in
+                self?.receiveTelemetry(state, bluetooth: true)
+            }
+        }
+        self.bleManager.onAckReceived = { [weak self] ack in
+            Task { @MainActor [weak self] in
+                self?.handleAck(ack)
+            }
+        }
+        self.bleManager.onMediaReceived = { [weak self] json in
+            Task { @MainActor [weak self] in
+                self?.handleMediaPacket(json)
+            }
+        }
+        self.bleManager.onHeartbeatReceived = { [weak self] ts in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.telemetry.lastBluetoothUpdateEpoch = ts
+                self.updateConnectivity()
+            }
+        }
+        self.bleManager.onVinSynced = { [weak self] syncedVin in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let clean = syncedVin.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(with: Locale(identifier: "en_US_POSIX"))
+                if clean.count == 17 && clean != self.vin {
+                    self.vin = clean
+                    self.defaults.set(clean, forKey: "vin")
+                    self.bleManager.updateCredentials(vin: clean, secret: self.secretKey)
+                    self.mqttClient.updateConfig(brokerUrl: self.brokerUrl, vin: clean, secretKey: self.secretKey)
                 }
             }
         }
@@ -205,6 +255,7 @@ final class VehicleViewModel: ObservableObject {
         if !cleanVin.isEmpty {
             self.mqttClient.connect()
         }
+        self.bleManager.connect()
 
         self.tickerTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -221,6 +272,7 @@ final class VehicleViewModel: ObservableObject {
 
     deinit {
         tickerTask?.cancel()
+        bleManager.disconnect()
         mqttClient.disconnect()
     }
 
@@ -388,6 +440,8 @@ final class VehicleViewModel: ObservableObject {
             carPlate = qrPlate
         }
 
+        bleManager.updateCredentials(vin: vin, secret: secretKey)
+        bleManager.reconnectNow()
         mqttClient.updateConfig(brokerUrl: brokerUrl, vin: vin, secretKey: secretKey)
         verifyPairConfirmWithAgent(
             pinCode: qrCode,
@@ -402,6 +456,8 @@ final class VehicleViewModel: ObservableObject {
                 self.brokerUrl = prevBroker
                 self.secretKey = prevSecret
                 self.carPlate = prevPlate
+                self.bleManager.updateCredentials(vin: prevVin, secret: prevSecret)
+                self.bleManager.reconnectNow()
                 self.mqttClient.updateConfig(brokerUrl: prevBroker, vin: prevVin, secretKey: prevSecret)
             },
             completion: completion
@@ -454,9 +510,9 @@ final class VehicleViewModel: ObservableObject {
         if !plateTrim.isEmpty { params["plate"] = plateTrim }
 
         Task { @MainActor in
-            if !cloudConnected {
+            if btState != .connected && !cloudConnected {
                 let deadline = Date().addingTimeInterval(6.0)
-                while !cloudConnected && Date() < deadline {
+                while btState != .connected && !cloudConnected && Date() < deadline {
                     try? await Task.sleep(nanoseconds: 200_000_000)
                 }
             }
@@ -473,6 +529,7 @@ final class VehicleViewModel: ObservableObject {
                 return
             }
 
+            let useBt = (btState == .connected)
             let timeoutTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 12_000_000_000)
                 guard let self else { return }
@@ -482,10 +539,18 @@ final class VehicleViewModel: ObservableObject {
                 self.pending.removeValue(forKey: msgId)
                 self.pendingCommandCount = self.pending.count
             }
-            pending[msgId] = PendingCommand(action: "PAIR_CONFIRM", timeoutTask: timeoutTask, silent: true, sentAt: Date(), optimisticKeys: [])
+            pending[msgId] = PendingCommand(
+                action: "PAIR_CONFIRM",
+                timeoutTask: timeoutTask,
+                silent: true,
+                channelUsed: useBt ? "Blutuz" : "Bulud",
+                sentAt: Date(),
+                optimisticKeys: []
+            )
             pendingCommandCount = pending.count
 
-            guard mqttClient.sendSignedCommand(payload, msgId: msgId) else {
+            let sent = useBt ? bleManager.sendCommand(payload) : mqttClient.sendSignedCommand(payload, msgId: msgId)
+            guard sent else {
                 pending.removeValue(forKey: msgId)?.timeoutTask.cancel()
                 pendingCommandCount = pending.count
                 onFailureRollback?()
@@ -496,7 +561,7 @@ final class VehicleViewModel: ObservableObject {
             }
 
             let res: (Bool, String) = await withCheckedContinuation { cont in
-                ackWaiters[msgId] = cont
+                self.ackWaiters[msgId] = cont
             }
             if res.0 {
                 onSuccessCommit?()
@@ -514,6 +579,19 @@ final class VehicleViewModel: ObservableObject {
     }
 
     // MARK: - Connection & Telemetry Lifecycle
+
+    func toggleBluetoothConnection() {
+        if btState != .disconnected {
+            bluetoothWanted = false
+            bleManager.disconnect()
+            showBanner("Blutuz əlaqəsi dayandırıldı", severity: .info, channelLabel: "Blutuz")
+        } else {
+            bluetoothWanted = true
+            bleManager.connect()
+            showBanner("Blutuz (BLE) axtarılır...", severity: .info, channelLabel: "Blutuz")
+        }
+        updateConnectivity()
+    }
 
     func toggleCloudConnection() {
         if mqttClient.state != .disconnected {
@@ -584,6 +662,8 @@ final class VehicleViewModel: ObservableObject {
         let empty = TelemetryState(vin: vehicleVin)
         lastConfirmedTelemetry = empty
         telemetry = empty
+        bleManager.updateCredentials(vin: vehicleVin, secret: key)
+        if bluetoothWanted { bleManager.reconnectNow() }
         mqttClient.updateConfig(brokerUrl: broker, vin: vehicleVin, secretKey: key)
         if !manualCloudDisabled {
             mqttClient.connect()
@@ -626,22 +706,26 @@ final class VehicleViewModel: ObservableObject {
         guard !vin.isEmpty else { return }
         let now = Date()
         guard now.timeIntervalSince(lastSilentPingAt) >= CommandProtocol.pingIntervalSeconds else { return }
-        guard cloudConnected else { return }
+        let btConn = (btState == .connected)
+        guard btConn || cloudConnected else { return }
         let nowSec = Int64(now.timeIntervalSince1970)
-        guard nowSec - telemetry.lastCloudUpdateEpoch >= 10 else { return }
+        let staleCloud = cloudConnected && (nowSec - telemetry.lastCloudUpdateEpoch >= 10)
+        let staleBt = btConn && (nowSec - telemetry.lastBluetoothUpdateEpoch >= 10)
+        guard staleCloud || staleBt else { return }
         lastSilentPingAt = now
         _ = dispatchCommand(CommandProtocol.actionPing, params: [:], silent: true)
     }
 
-    private func receiveTelemetry(_ state: TelemetryState) {
+    private func receiveTelemetry(_ state: TelemetryState, bluetooth: Bool) {
         if !vin.isEmpty && !state.vin.isEmpty && state.vin.caseInsensitiveCompare(vin) != .orderedSame { return }
         guard state.lastUpdateEpoch > 0 else { return }
         let nowSec = Int64(Date().timeIntervalSince1970)
-        let lastCloud = state.isLiveCloudSample ? nowSec : telemetry.lastCloudUpdateEpoch
-        if state.isLiveCloudSample { agentPresenceOnline = true }
+        let lastCloud = (bluetooth || !state.isLiveCloudSample) ? telemetry.lastCloudUpdateEpoch : nowSec
+        let lastBt = bluetooth ? nowSec : telemetry.lastBluetoothUpdateEpoch
+        if !bluetooth && state.isLiveCloudSample { agentPresenceOnline = true }
 
         let base = lastConfirmedTelemetry
-        let backwardCorrection = state.isLiveCloudSample && base.lastUpdateEpoch > 0 && (base.lastUpdateEpoch - state.lastUpdateEpoch) > 60
+        let backwardCorrection = (bluetooth || state.isLiveCloudSample) && base.lastUpdateEpoch > 0 && (base.lastUpdateEpoch - state.lastUpdateEpoch) > 60
         let merged = (state.lastUpdateEpoch >= base.lastUpdateEpoch || base.lastUpdateEpoch <= 0 || backwardCorrection)
             ? state.mergeWithPrevious(base) : base
 
@@ -649,8 +733,10 @@ final class VehicleViewModel: ObservableObject {
         var applied = optimisticRegistry.applyTo(merged)
         applied.isDualSync = syncTemperatures
         applied.isCloudTransportConnected = cloudConnected
+        applied.isBluetoothConnected = (btState == .connected)
         applied.isPresenceOnline = agentPresenceOnline
         applied.lastCloudUpdateEpoch = lastCloud
+        applied.lastBluetoothUpdateEpoch = lastBt
         let cloudDelta = nowSec - lastCloud
         applied.isBrokerConnected = cloudConnected && (agentPresenceOnline || (lastCloud > 0 && (-30...CommandProtocol.telemetryOnlineStaleSeconds).contains(cloudDelta)))
         applied = evaluateOnlineWithGrace(applied, nowSec: nowSec)
@@ -658,7 +744,7 @@ final class VehicleViewModel: ObservableObject {
         wiperServiceActive = applied.wiperServiceMode
         updateConnectionUiState()
 
-        if state.isLiveCloudSample {
+        if bluetooth || state.isLiveCloudSample {
             let localPlate = carPlate.trimmingCharacters(in: .whitespacesAndNewlines)
             if !localPlate.isEmpty,
                localPlate.caseInsensitiveCompare(applied.agentVehiclePlate.trimmingCharacters(in: .whitespacesAndNewlines)) != .orderedSame,
@@ -675,13 +761,15 @@ final class VehicleViewModel: ObservableObject {
 
     private func evaluateOnlineWithGrace(_ state: TelemetryState, nowSec: Int64) -> TelemetryState {
         var next = state
-        if state.isCloudLive(nowSeconds: nowSec) {
+        if state.isTrulyOnline(nowSeconds: nowSec) {
             lastOnlineAt = Date()
             next.isConnected = true
             next.isReconnectingGrace = false
             return next
         }
-        let recovering = (mqttClient.state == .connecting || mqttClient.state == .reconnecting) && !manualCloudDisabled
+        let cloudRecovering = (mqttClient.state == .connecting || mqttClient.state == .reconnecting) && !manualCloudDisabled
+        let btRecovering = (btState == .connecting) && bluetoothWanted
+        let recovering = cloudRecovering || btRecovering
         let withinGrace = (lastOnlineAt.map { Date().timeIntervalSince($0) <= CommandProtocol.reconnectGraceSeconds } ?? false) && recovering
         next.isConnected = withinGrace
         next.isReconnectingGrace = withinGrace
@@ -696,12 +784,20 @@ final class VehicleViewModel: ObservableObject {
         case .reconnecting: cs = .reconnecting
         case .connected: cs = .connected
         }
+        let bs: LinkHealthState
+        switch btState {
+        case .disconnected: bs = .disconnected
+        case .connecting: bs = .connecting
+        case .connected: bs = .connected
+        }
         let next = ConnectionUiState(
             cloudState: cs,
+            btState: bs,
             agentPresenceOnline: agentPresenceOnline,
             isReconnectingInGrace: telemetry.isReconnectingGrace,
             isOnline: telemetry.isConnected,
-            cloudLatencyMs: cloudLatencyMs
+            cloudLatencyMs: cloudLatencyMs,
+            btLatencyMs: btLatencyMs
         )
         if connectionUiState != next {
             connectionUiState = next
@@ -713,6 +809,7 @@ final class VehicleViewModel: ObservableObject {
         var cur = telemetry
         let delta = nowSec - cur.lastCloudUpdateEpoch
         cur.isCloudTransportConnected = cloudConnected
+        cur.isBluetoothConnected = (btState == .connected)
         cur.isPresenceOnline = agentPresenceOnline
         cur.isBrokerConnected = cloudConnected && (agentPresenceOnline || (cur.lastCloudUpdateEpoch > 0 && (-30...CommandProtocol.telemetryOnlineStaleSeconds).contains(delta)))
         cur = evaluateOnlineWithGrace(cur, nowSec: nowSec)
@@ -781,8 +878,10 @@ final class VehicleViewModel: ObservableObject {
         restored.isDualSync = telemetry.isDualSync
         restored.isBrokerConnected = telemetry.isBrokerConnected
         restored.isCloudTransportConnected = telemetry.isCloudTransportConnected
+        restored.isBluetoothConnected = telemetry.isBluetoothConnected
         restored.isPresenceOnline = telemetry.isPresenceOnline
         restored.lastCloudUpdateEpoch = telemetry.lastCloudUpdateEpoch
+        restored.lastBluetoothUpdateEpoch = telemetry.lastBluetoothUpdateEpoch
         restored.isConnected = telemetry.isConnected
         restored.isReconnectingGrace = telemetry.isReconnectingGrace
         telemetry = restored
@@ -847,7 +946,17 @@ final class VehicleViewModel: ObservableObject {
         if action == "START_CAMERA_STREAM" { activeVideoId = id }
         if action == "START_CABIN_AUDIO_STREAM" { activeCabinAudioId = id }
 
-        pending[id] = PendingCommand(action: action, timeoutTask: timeoutTask, silent: silent, sentAt: Date(), optimisticKeys: optimisticKeys)
+        let useBt = (btState == .connected)
+        let channelLabel = useBt ? "Blutuz" : "Bulud"
+
+        pending[id] = PendingCommand(
+            action: action,
+            timeoutTask: timeoutTask,
+            silent: silent,
+            channelUsed: channelLabel,
+            sentAt: Date(),
+            optimisticKeys: optimisticKeys
+        )
         if mediaActions.contains(action) {
             mediaRequests[id] = Date().addingTimeInterval(timeoutSec)
         }
@@ -857,14 +966,30 @@ final class VehicleViewModel: ObservableObject {
         if !silent {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 450_000_000)
-                if self?.pending[id] != nil {
-                    self?.showBanner("Təsdiq gözlənilir...", severity: .pending, channelLabel: "Bulud", autoDismissMs: 5000)
+                if let current = self?.pending[id] {
+                    self?.showBanner("Təsdiq gözlənilir...", severity: .pending, channelLabel: current.channelUsed, autoDismissMs: 5000)
                 }
             }
         }
 
+        if useBt {
+            if bleManager.sendCommand(payload) {
+                if cloudConnected {
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 1_200_000_000)
+                        if self?.pending[id] != nil {
+                            _ = self?.mqttClient.sendSignedCommand(payload, msgId: id)
+                        }
+                    }
+                }
+                return true
+            }
+        } else if bluetoothWanted {
+            bleManager.reconnectNow()
+        }
+
         guard mqttClient.sendSignedCommand(payload, msgId: id) else {
-            finishCommand(id, text: "Bulud bağlantısı hazır deyil", isError: true)
+            finishCommand(id, text: "Bulud və Blutuz hazır deyil", isError: true)
             return false
         }
         return true
@@ -890,7 +1015,7 @@ final class VehicleViewModel: ObservableObject {
         }
         guard !item.silent else { return }
         let sev = severityOverride ?? (isError ? .error : .success)
-        showBanner(text, severity: sev, channelLabel: "Bulud", autoDismissMs: sev != .success ? 3600 : 2400)
+        showBanner(text, severity: sev, channelLabel: item.channelUsed, autoDismissMs: sev != .success ? 3600 : 2400)
     }
 
     private func clearPendingSilently(_ id: String?) {
@@ -912,16 +1037,21 @@ final class VehicleViewModel: ObservableObject {
             return
         }
         guard let item = pending[id] else { return }
-        cloudLatencyMs = max(1, Int64(Date().timeIntervalSince(item.sentAt) * 1000))
+        let rtt = max(1, Int64(Date().timeIntervalSince(item.sentAt) * 1000))
+        if item.channelUsed == "Blutuz" { btLatencyMs = rtt } else { cloudLatencyMs = rtt }
         updateConnectionUiState()
 
         if item.action == CommandProtocol.actionPing {
             pending.removeValue(forKey: id)?.timeoutTask.cancel()
             pendingCommandCount = pending.count
             let nowSec = Int64(Date().timeIntervalSince1970)
-            agentPresenceOnline = true
-            telemetry.lastCloudUpdateEpoch = nowSec
-            telemetry.isPresenceOnline = true
+            if item.channelUsed == "Blutuz" {
+                telemetry.lastBluetoothUpdateEpoch = nowSec
+            } else {
+                agentPresenceOnline = true
+                telemetry.lastCloudUpdateEpoch = nowSec
+                telemetry.isPresenceOnline = true
+            }
             updateConnectivity()
             return
         }
@@ -938,7 +1068,7 @@ final class VehicleViewModel: ObservableObject {
         if item.action == "VENT_CABIN" && ok { beginVentilationCountdown() }
         if status == "ACCEPTED" && mediaActions.contains(item.action) {
             if !item.silent {
-                showBanner("Agent qəbul etdi: \(details)", severity: .pending, channelLabel: "Bulud", autoDismissMs: 6000)
+                showBanner("Agent qəbul etdi: \(details)", severity: .pending, channelLabel: item.channelUsed, autoDismissMs: 6000)
             }
             return
         }
@@ -1645,7 +1775,11 @@ final class VehicleViewModel: ObservableObject {
             params: ["sessionId": session, "op": "volume", "volume": Double(clamped), "sentAt": Int64(Date().timeIntervalSince1970 * 1000)],
             secret: secretKey
            ) {
-            _ = mqttClient.sendLiveAudio(payload)
+            if btState == .connected {
+                _ = bleManager.sendCommand(payload)
+            } else {
+                _ = mqttClient.sendLiveAudio(payload)
+            }
         }
     }
 
@@ -1659,8 +1793,8 @@ final class VehicleViewModel: ObservableObject {
 
     func startLiveTalk() {
         guard !isTalking else { return }
-        guard cloudConnected else {
-            showBanner("Canlı səs üçün Bulud bağlantısı lazımdır", severity: .warning)
+        guard btState == .connected || cloudConnected else {
+            showBanner("Canlı səs üçün Blutuz və ya Bulud bağlantısı lazımdır", severity: .warning)
             return
         }
         audioManager.requestMicrophonePermission { [weak self] granted in
@@ -1679,6 +1813,7 @@ final class VehicleViewModel: ObservableObject {
         let session = UUID().uuidString.lowercased()
         currentLiveSession = session
         talkSeq = 0
+        let useBt = (btState == .connected)
 
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1692,8 +1827,9 @@ final class VehicleViewModel: ObservableObject {
                 self.currentLiveSession = nil
                 return
             }
-            talkStartId = startMsgId
-            guard mqttClient.sendLiveAudio(startPayload) else {
+            self.talkStartId = startMsgId
+            let startSent = useBt ? self.bleManager.sendCommand(startPayload) : self.mqttClient.sendLiveAudio(startPayload)
+            guard startSent else {
                 self.isTalking = false
                 self.currentLiveSession = nil
                 self.showBanner("Canlı səs kanalı hazır deyil", severity: .error)
@@ -1732,7 +1868,11 @@ final class VehicleViewModel: ObservableObject {
                             "sentAt": Int64(Date().timeIntervalSince1970 * 1000)
                         ]
                         if let (_, payload) = CommandProtocol.createSignedCommand(action: "AVAS_TALK", vin: self.vin, params: params, secret: self.secretKey) {
-                            _ = self.mqttClient.sendLiveAudio(payload)
+                            if useBt && self.btState == .connected {
+                                _ = self.bleManager.sendCommand(payload)
+                            } else {
+                                _ = self.mqttClient.sendLiveAudio(payload)
+                            }
                         }
                     }
                 },
@@ -1764,7 +1904,11 @@ final class VehicleViewModel: ObservableObject {
             params: ["sessionId": session, "op": "stop", "sentAt": Int64(Date().timeIntervalSince1970 * 1000)],
             secret: secretKey
            ) {
-            _ = mqttClient.sendLiveAudio(payload)
+            if btState == .connected {
+                _ = bleManager.sendCommand(payload)
+            } else {
+                _ = mqttClient.sendLiveAudio(payload)
+            }
         }
     }
 
@@ -1827,10 +1971,16 @@ final class VehicleViewModel: ObservableObject {
 
     func startLiveVideo(cameraId: String) {
         guard !isVideoStreaming else { return }
-        guard telemetry.isBrokerConnected else {
+        let transport: String
+        if telemetry.isBrokerConnected {
+            transport = "MQTT"
+        } else if btState == .connected {
+            transport = "BT"
+        } else {
             showBanner("Kamera üçün avtomobillə canlı bağlantı yoxdur", severity: .info)
             return
         }
+        activeVideoTransport = transport
         lastVideoSequence = 0
         fpsWindowStart = nil
         fpsFrameCount = 0
@@ -1842,7 +1992,7 @@ final class VehicleViewModel: ObservableObject {
         cameraTimestampMs = 0
         isVideoStreaming = true
 
-        guard dispatchCommand("START_CAMERA_STREAM", params: ["cameraId": cameraId, "transport": "MQTT"]),
+        guard dispatchCommand("START_CAMERA_STREAM", params: ["cameraId": cameraId, "transport": transport]),
               let stream = activeVideoId else {
             isVideoStreaming = false
             return
@@ -1863,7 +2013,7 @@ final class VehicleViewModel: ObservableObject {
                 ]
                 var sent = false
                 if let (_, payload) = CommandProtocol.createSignedCommand(action: "CAMERA_KEEPALIVE", vin: self.vin, params: kaParams, secret: self.secretKey) {
-                    sent = self.mqttClient.sendLiveAudio(payload)
+                    sent = (transport == "BT") ? self.bleManager.sendCommand(payload) : self.mqttClient.sendLiveAudio(payload)
                 }
                 if !sent {
                     misses += 1
@@ -1890,7 +2040,7 @@ final class VehicleViewModel: ObservableObject {
             return
         }
         h264Decoder.waitForKeyframe()
-        _ = dispatchCommand("CAMERA_SWITCH", params: ["streamId": stream, "cameraId": cameraId, "transport": "MQTT"], silent: true)
+        _ = dispatchCommand("CAMERA_SWITCH", params: ["streamId": stream, "cameraId": cameraId, "transport": activeVideoTransport], silent: true)
     }
 
     func stopLiveVideo() {
@@ -1968,14 +2118,20 @@ final class VehicleViewModel: ObservableObject {
 
     private func startCabinAudioListening() {
         guard !isCabinListening else { return }
-        guard telemetry.isBrokerConnected else {
+        let transport: String
+        if btState == .connected {
+            transport = "BT"
+        } else if telemetry.isBrokerConnected {
+            transport = "MQTT"
+        } else {
             showBanner("Salon səsi üçün avtomobillə canlı bağlantı yoxdur", severity: .info)
             return
         }
+        activeCabinTransport = transport
         cabinListenKeepaliveTask?.cancel()
         lastAudioSequence = 0
         isCabinListening = true
-        guard dispatchCommand("START_CABIN_AUDIO_STREAM", params: ["transport": "MQTT", "keepalive": true]) else {
+        guard dispatchCommand("START_CABIN_AUDIO_STREAM", params: ["transport": transport, "keepalive": true]) else {
             isCabinListening = false
             return
         }
@@ -1985,7 +2141,11 @@ final class VehicleViewModel: ObservableObject {
                 if let activeId = self.activeCabinAudioId {
                     self.mediaRequests[activeId] = Date().addingTimeInterval(15)
                     if let (_, kaPayload) = CommandProtocol.createSignedCommand(action: "CABIN_AUDIO_KEEPALIVE", vin: self.vin, params: ["streamId": activeId], secret: self.secretKey) {
-                        _ = self.mqttClient.sendLiveAudio(kaPayload)
+                        if transport == "BT" {
+                            _ = self.bleManager.sendCommand(kaPayload)
+                        } else {
+                            _ = self.mqttClient.sendLiveAudio(kaPayload)
+                        }
                     }
                 }
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
