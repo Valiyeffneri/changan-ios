@@ -12,6 +12,7 @@ final class BleVehicleManager: NSObject, CBCentralManagerDelegate, CBPeripheralD
     private static let serviceUuid = CBUUID(string: "5ea7c589-2677-4e6b-9a13-1b5c9d28f701")
     private static let commandRxUuid = CBUUID(string: "5ea7c589-2677-4e6b-9a13-1b5c9d28f702")
     private static let telemetryTxUuid = CBUUID(string: "5ea7c589-2677-4e6b-9a13-1b5c9d28f703")
+    private static let savedPeripheralUuidKey = "last_ble_peripheral_uuid"
 
     private let queue = DispatchQueue(label: "az.c589.changanremote.ble", qos: .userInitiated)
     private let lock = NSLock()
@@ -26,6 +27,7 @@ final class BleVehicleManager: NSObject, CBCentralManagerDelegate, CBPeripheralD
     private var secretKey: String
     private var rxBuffer = Data()
     private var rescanTimer: DispatchSourceTimer?
+    private var connectAttemptStartedAt: Date?
 
     var onStateChanged: ((BtConnectionState) -> Void)?
     var onTelemetryReceived: ((TelemetryState) -> Void)?
@@ -116,7 +118,12 @@ final class BleVehicleManager: NSObject, CBCentralManagerDelegate, CBPeripheralD
         }
 
         queue.async {
-            let writeType: CBCharacteristicWriteType = rxChar.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+            // Prefer acknowledged ATT Write (.withResponse) for control packets so weak RSSI / long range
+            // automatically retransmits at the GATT/L2CAP layer instead of silently dropping chunks.
+            let useWithResponse = rxChar.properties.contains(.write) && data.count <= 2048
+            let writeType: CBCharacteristicWriteType = useWithResponse
+                ? .withResponse
+                : (rxChar.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse)
             let maxChunk = max(20, min(peripheral.maximumWriteValueLength(for: writeType), 180))
             var offset = 0
             while offset < data.count {
@@ -129,7 +136,7 @@ final class BleVehicleManager: NSObject, CBCentralManagerDelegate, CBPeripheralD
         return true
     }
 
-    private func beginScanOrConnectIfReady() {
+    private func beginScanOrConnectIfReady(forceResetConnect: Bool = false) {
         lock.lock()
         let active = requested
         lock.unlock()
@@ -148,31 +155,59 @@ final class BleVehicleManager: NSObject, CBCentralManagerDelegate, CBPeripheralD
             return
         }
 
-        state = .connecting
-        let retrieved = cm.retrieveConnectedPeripherals(withServices: [Self.serviceUuid])
-        if let existing = retrieved.first {
-            connectToPeripheral(existing)
+        // Do not abort an in-flight long-range BLE connection handshake unless it has timed out (>18s)
+        if !forceResetConnect,
+           let current = connectedPeripheral,
+           current.state == .connecting,
+           let started = connectAttemptStartedAt,
+           Date().timeIntervalSince(started) < 18.0 {
+            cm.scanForPeripherals(
+                withServices: [Self.serviceUuid],
+                options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+            )
             return
         }
 
+        state = .connecting
+        let retrieved = cm.retrieveConnectedPeripherals(withServices: [Self.serviceUuid])
+        if let existing = retrieved.first {
+            connectToPeripheral(existing, stopScanning: true)
+            return
+        }
+
+        // Direct hardware page-scan connection to last paired vehicle peripheral (vastly extends range)
+        if let savedStr = UserDefaults.standard.string(forKey: Self.savedPeripheralUuidKey),
+           let savedUuid = UUID(uuidString: savedStr) {
+            let known = cm.retrievePeripherals(withIdentifiers: [savedUuid])
+            if let target = known.first {
+                connectToPeripheral(target, stopScanning: false)
+            }
+        }
+
+        // Run active duplicate-enabled scan in parallel to catch the vehicle immediately
         cm.scanForPeripherals(
             withServices: [Self.serviceUuid],
-            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
         )
     }
 
-    private func connectToPeripheral(_ peripheral: CBPeripheral) {
-        centralManager?.stopScan()
+    private func connectToPeripheral(_ peripheral: CBPeripheral, stopScanning: Bool = true) {
+        if stopScanning {
+            centralManager?.stopScan()
+        }
         connectedPeripheral = peripheral
+        connectAttemptStartedAt = Date()
         peripheral.delegate = self
         rxBuffer.removeAll(keepingCapacity: true)
-        centralManager?.connect(peripheral, options: nil)
+        centralManager?.connect(peripheral, options: [
+            CBConnectPeripheralOptionNotifyOnDisconnectionKey: true
+        ])
     }
 
     private func startRescanWatchdog() {
         stopRescanWatchdog()
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 8.0, repeating: 8.0)
+        timer.schedule(deadline: .now() + 6.0, repeating: 6.0)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             self.lock.lock()
@@ -180,7 +215,7 @@ final class BleVehicleManager: NSObject, CBCentralManagerDelegate, CBPeripheralD
             self.lock.unlock()
             guard active else { return }
             if self.state != .connected {
-                self.beginScanOrConnectIfReady()
+                self.beginScanOrConnectIfReady(forceResetConnect: false)
             }
         }
         timer.resume()
@@ -208,12 +243,18 @@ final class BleVehicleManager: NSObject, CBCentralManagerDelegate, CBPeripheralD
         let active = requested
         lock.unlock()
         guard active else { return }
-        if connectedPeripheral == nil || connectedPeripheral?.state != .connected {
-            connectToPeripheral(peripheral)
+        UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: Self.savedPeripheralUuidKey)
+        if connectedPeripheral == nil || (connectedPeripheral?.state != .connected && connectedPeripheral?.state != .connecting) {
+            connectToPeripheral(peripheral, stopScanning: true)
+        } else if connectedPeripheral?.identifier == peripheral.identifier {
+            central.stopScan()
         }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        central.stopScan()
+        connectAttemptStartedAt = nil
+        UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: Self.savedPeripheralUuidKey)
         rxBuffer.removeAll(keepingCapacity: true)
         peripheral.delegate = self
         peripheral.discoverServices([Self.serviceUuid])
@@ -272,8 +313,20 @@ final class BleVehicleManager: NSObject, CBCentralManagerDelegate, CBPeripheralD
             }
         }
         if rxCharacteristic != nil && txCharacteristic != nil {
-            state = .connected
-            onHeartbeatReceived?(Int64(Date().timeIntervalSince1970))
+            if txCharacteristic?.isNotifying == true {
+                state = .connected
+                onHeartbeatReceived?(Int64(Date().timeIntervalSince1970))
+            } else {
+                queue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                    guard let self,
+                          self.connectedPeripheral?.state == .connected,
+                          self.rxCharacteristic != nil,
+                          self.txCharacteristic != nil,
+                          self.state != .connected else { return }
+                    self.state = .connected
+                    self.onHeartbeatReceived?(Int64(Date().timeIntervalSince1970))
+                }
+            }
         }
     }
 
