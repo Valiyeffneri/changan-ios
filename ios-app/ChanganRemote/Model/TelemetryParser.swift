@@ -19,7 +19,7 @@ enum TelemetryParser {
             return cursor
         }
 
-        func integer(_ path: String, min: Int = 0, max: Int = Int.MAX_VALUE, missingDefault: Int = -1) -> Int {
+        func integer(_ path: String, min: Int = 0, max: Int = Int.max, missingDefault: Int = -1) -> Int {
             guard let num = value(path) as? NSNumber,
                   CFGetTypeID(num) != CFBooleanGetTypeID() else {
                 unavailable.insert(path)

@@ -125,7 +125,7 @@ final class H264VideoDecoder {
         guard status1 == kCMBlockBufferNoErr, let blockBuffer else { return false }
 
         let status2 = avccData.withUnsafeBytes { rawBuf -> OSStatus in
-            guard let base = rawBuf.baseAddress else { return kCMBlockBufferBadBlockBufferErr }
+            guard let base = rawBuf.baseAddress else { return -1 }
             return CMBlockBufferReplaceDataBytes(
                 with: base,
                 blockBuffer: blockBuffer,
@@ -155,9 +155,15 @@ final class H264VideoDecoder {
         )
         guard status3 == noErr, let sampleBuffer else { return false }
 
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) as? NSMutableArray,
-           let dict = attachments.firstObject as? NSMutableDictionary {
-            dict[kCMSampleAttachmentKey_DisplayImmediately as String] = true
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),
+           CFArrayGetCount(attachments) > 0,
+           let rawPtr = CFArrayGetValueAtIndex(attachments, 0) {
+            let dict = Unmanaged<CFMutableDictionary>.fromOpaque(rawPtr).takeUnretainedValue()
+            CFDictionarySetValue(
+                dict,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
         }
 
         DispatchQueue.main.async {

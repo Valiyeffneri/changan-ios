@@ -1708,7 +1708,7 @@ final class VehicleViewModel: ObservableObject {
                 }
             }
             let (opened, reason): (Bool, String) = await withCheckedContinuation { cont in
-                talkReadyWaiter = cont
+                self.talkReadyWaiter = cont
             }
             timeoutTask.cancel()
             guard opened, currentLiveSession == session, isTalking else {

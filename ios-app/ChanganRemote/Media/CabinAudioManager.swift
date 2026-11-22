@@ -157,7 +157,7 @@ final class CabinAudioManager {
 
     private func configureAudioSessionForVoice() {
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+        try? session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker])
         try? session.setPreferredSampleRate(16000)
         try? session.setActive(true)
     }
